@@ -41,13 +41,13 @@ COLOR = [("L_star", "L* (clarté CIELAB)"), ("a_star", "a* (vert−/rouge+)"), (
 TRAITS = {
     "gousses": ("🫘 Gousses", [
         ("longueur_mm", "Longueur (mm)"), ("largeur_mm", "Largeur (mm)"),
-        ("epaisseur_mm", "Épaisseur (mm)"), ("poids_g", "Poids (g)"),
+        ("epaisseur_mm", "Épaisseur (mm)"), ("poids_g", "Poids frais (g)"),
         ("nb_graines", "Nb graines"), ("poids_graines_g", "Poids graines (g)"),
         ("sucres_brix", "Sucres pulpe (°Brix)")] + COLOR),
     "feuilles": ("🍃 Feuilles / folioles", [
         ("nb_paires_folioles", "Paires de folioles"), ("long_foliole_mm", "Long. foliole (mm)"),
         ("larg_foliole_mm", "Larg. foliole (mm)"), ("long_rachis_mm", "Long. rachis (mm)"),
-        ("masse_seche_foliole_mg", "Masse sèche foliole (mg)"), ("spad", "Indice chlorophylle SPAD")] + COLOR),
+        ("masse_seche_foliole_mg", "Masse sèche foliole (mg)"), ("spad", "Indice chlorophylle SPAD"), ("surface_mm2", "Surface mesurée (mm²)")] + COLOR),
     "graines": ("🌰 Graines", [
         ("longueur_mm", "Longueur (mm)"), ("largeur_mm", "Largeur (mm)"),
         ("epaisseur_mm", "Épaisseur (mm)"), ("poids_mg", "Poids (mg)")] + COLOR),
@@ -62,6 +62,10 @@ TRAITS = {
         ("masse_graines_g", "Masse graines (g)"), ("masse_endosperme_g", "Masse endosperme (g)"),
         ("masse_gomme_g", "Masse gomme LBG extraite (g)"), ("galactomannane_pct", "Galactomannane (% gomme)")]),
 }
+# Champs texte du protocole (colonnes TEXT) et champs « arbre » supplémentaires
+TXT = {"gousses": ["fruit_id", "fruit_maturite"], "graines": ["seed_id", "fruit_id", "couleur", "forme", "durete"], "feuilles": ["leaf_id"]}
+ARBRE_COLS = ["id_echantillon", "population", "date_collecte", "collecteur", "zone_agroecologique", "site", "wilaya", "statut", "etat_sanitaire"]
+FORMES = ["sphérique", "ovale", "elliptique", "allongée"]
 PREFIX = {"gousses": "g", "feuilles": "f", "graines": "s", "biochimie": "b", "architecture": "a"}
 
 
@@ -95,11 +99,18 @@ def migrate():
         for c, _ in cols:
             if c not in have:
                 ex(f"ALTER TABLE {t} ADD COLUMN {c} REAL")
+    for t, cols in [*TXT.items(), ("arbres", ARBRE_COLS)]:
+        have = set(q(f"PRAGMA table_info({t})").name)
+        for c in cols:
+            if c not in have:
+                ex(f"ALTER TABLE {t} ADD COLUMN {c} TEXT")
 
 def ins(t, aid, vals, source="manuel"):
-    cols = [c for c, _ in TRAITS[t][1]]
-    ex(f"INSERT INTO {t}(arbre_id,date_mesure,{','.join(cols)},source) VALUES(?,?,{','.join('?' * len(cols))},?)",
-       [aid, str(datetime.date.today())] + [None if pd.isna(vals.get(c)) else float(vals[c]) for c in cols] + [source])
+    cols = [c for c, _ in TRAITS[t][1]]; tx = TXT.get(t, [])
+    nul = lambda v: v is None or (not isinstance(v, str) and pd.isna(v)) or v == ""
+    ex(f"INSERT INTO {t}(arbre_id,date_mesure,{','.join(tx + cols)},source) VALUES(?,?,{','.join('?' * (len(tx) + len(cols)))},?)",
+       [aid, str(datetime.date.today())] + [None if nul(vals.get(c)) else str(vals[c]) for c in tx]
+       + [None if nul(vals.get(c)) else float(vals[c]) for c in cols] + [source])
 
 
 # ─────────────────────────── Indices dérivés ───────────────────────────
@@ -112,11 +123,13 @@ def add_indices(t, d):
             d[c] = pd.to_numeric(d[c], errors="coerce")
     if t == "gousses":
         d["ratio_L_l"] = d.longueur_mm / d.largeur_mm
+        d["poids_pulpe_g"] = d.poids_g - d.poids_graines_g
+        d["rendement_graines_pct"] = d.poids_graines_g / d.poids_g * 100
         d["pulpe_pct"] = (d.poids_g - d.poids_graines_g) / d.poids_g * 100
         d["poids_moy_graine_mg"] = d.poids_graines_g / d.nb_graines.replace(0, np.nan) * 1000
     elif t == "feuilles":
         d["ratio_L_l"] = d.long_foliole_mm / d.larg_foliole_mm
-        d["surface_foliole_cm2"] = math.pi / 4 * d.long_foliole_mm * d.larg_foliole_mm / 100  # ellipse
+        d["surface_foliole_cm2"] = (d.surface_mm2 / 100).fillna(math.pi / 4 * d.long_foliole_mm * d.larg_foliole_mm / 100)  # mesurée, sinon ellipse
         d["sla_cm2_g"] = d.surface_foliole_cm2 / (d.masse_seche_foliole_mg / 1000)
     elif t == "architecture":
         d["surface_projection_m2"] = math.pi / 4 * d.diam_cime_1_m * d.diam_cime_2_m
@@ -232,20 +245,28 @@ def page_dashboard():
     st.plotly_chart(px.histogram(d, x=v, color="cultivar", barmode="overlay", opacity=.7, nbins=30), width="stretch")
 
 def page_arbres():
-    st.header("🌳 Arbres / accessions")
+    st.header("🌳 Arbres / accessions (protocole)")
     with st.form("arbre"):
-        c = st.columns(3)
-        code = c[0].text_input("Code unique*"); cv = c[1].selectbox("Cultivar", CULTIVARS); sx = c[2].selectbox("Sexe", SEXES)
+        c = st.columns(4)
+        code = c[0].text_input("Tree_ID* (code unique)"); ide = c[1].text_input("ID (échantillon)")
+        pop = c[2].text_input("Population"); dt = c[3].date_input("Date de collecte")
+        c = st.columns(4)
+        col = c[0].text_input("Collecteur"); zone = c[1].text_input("Zone agro-écologique")
+        site = c[2].text_input("Site"); wil = c[3].text_input("Wilaya")
+        c = st.columns(4)
+        stat = c[0].selectbox("Statut", ["spontané", "subspontané", "cultivé", "autre"]); sx = c[1].selectbox("Sexe observé", SEXES)
+        san = c[2].selectbox("État sanitaire", ["bon", "moyen", "dégradé", "attaqué"]); cv = c[3].selectbox("Cultivar", CULTIVARS)
         c = st.columns(4)
         lat = c[0].number_input("Latitude", value=35.0, format="%.5f"); lon = c[1].number_input("Longitude", value=2.0, format="%.5f")
         alt = c[2].number_input("Altitude (m)", 0.0, 3000.0, 300.0); age = c[3].number_input("Âge (ans)", 0, 1000, 20)
         notes = st.text_area("Notes")
         if st.form_submit_button("➕ Ajouter") and code:
             try:
-                ex("INSERT INTO arbres(code,cultivar,sexe,latitude,longitude,altitude_m,age_ans,notes) VALUES(?,?,?,?,?,?,?,?)",
-                   (code, cv, sx, lat, lon, alt, age, notes)); st.rerun()
+                ex("""INSERT INTO arbres(code,id_echantillon,population,date_collecte,collecteur,zone_agroecologique,site,wilaya,statut,
+                      sexe,etat_sanitaire,cultivar,latitude,longitude,altitude_m,age_ans,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (code, ide, pop, str(dt), col, zone, site, wil, stat, sx, san, cv, lat, lon, alt, age, notes)); st.rerun()
             except sqlite3.IntegrityError:
-                st.error("Ce code existe déjà.")
+                st.error("Ce Tree_ID existe déjà.")
     d = q("SELECT * FROM arbres")
     st.dataframe(d, width="stretch", hide_index=True)
     if not d.empty:
@@ -254,6 +275,21 @@ def page_arbres():
         if st.button("🗑️ Supprimer"):
             ex("DELETE FROM arbres WHERE id=?", (arbre_opts()[sel],)); st.rerun()
 
+def appliquer_edition(t, aid, old, new, tx, nums):
+    """Supprime les lignes retirées, met à jour les lignes conservées, insère les lignes ajoutées."""
+    nul = lambda v: v is None or (not isinstance(v, str) and pd.isna(v)) or v == ""
+    keep = set(new.id.dropna().astype(int))
+    for i in set(old.id) - keep:
+        ex(f"DELETE FROM {t} WHERE id=?", (int(i),))
+    for _, r in new.iterrows():
+        if nul(r.id):
+            if not r[tx + nums].isna().all():
+                ins(t, aid, r.to_dict())
+            continue
+        ex(f"UPDATE {t} SET {', '.join(c + '=?' for c in tx + nums)} WHERE id=?",
+           [None if nul(r[c]) else str(r[c]) for c in tx] + [None if nul(r[c]) else float(r[c]) for c in nums] + [int(r.id)])
+
+
 def page_saisie():
     st.header("📝 Saisie des mesures (tableau)")
     opts = arbre_opts()
@@ -261,21 +297,34 @@ def page_saisie():
         st.warning("Créez d'abord un arbre."); return
     aid = opts[st.selectbox("Arbre", opts)]
     tabs = st.tabs([TRAITS[t][0] for t in TRAITS])
+    sel = lambda *o: st.column_config.SelectboxColumn(options=list(o))
     for tab, t in zip(tabs, TRAITS):
         with tab:
-            cols = [c for c, _ in TRAITS[t][1]]
+            tx = TXT.get(t, []); nums = [c for c, _ in TRAITS[t][1]]
             cfg = {c: st.column_config.NumberColumn(l) for c, l in TRAITS[t][1]}
-            ed = st.data_editor(pd.DataFrame(columns=cols, dtype=float), num_rows="dynamic",
-                                column_config=cfg, key=f"ed_{t}", width="stretch")
+            cfg.update({c: st.column_config.TextColumn(c) for c in tx})
+            cfg.update({"forme": sel(*FORMES), "durete": sel("tendre", "moyenne", "dure", "très dure"),
+                        "fruit_maturite": sel("immature", "mature", "sur-mature", "sec")} if t != "gousses" else {"fruit_maturite": sel("immature", "mature", "sur-mature", "sec")})
+            empty = pd.DataFrame({**{c: pd.Series(dtype=object) for c in tx}, **{c: pd.Series(dtype=float) for c in nums}})
+            ed = st.data_editor(empty, num_rows="dynamic", column_config=cfg, key=f"ed_{t}", width="stretch")
             if st.button("💾 Enregistrer", key=f"sv_{t}"):
-                ed = ed.apply(pd.to_numeric, errors="coerce").dropna(how="all")
+                ed = ed.dropna(how="all")
                 for _, r in ed.iterrows():
                     ins(t, aid, r.to_dict())
                 st.success(f"{len(ed)} ligne(s) enregistrée(s)."); st.rerun()
-            st.caption("Une ligne = un organe (1 gousse, 1 foliole, 1 graine). Mesurer ≥ 10 organes par arbre.")
-            d = add_indices(t, q(f"SELECT * FROM {t} WHERE arbre_id=?", (aid,)))
-            if not d.empty:
-                st.dataframe(d.round(2), width="stretch", hide_index=True)
+            st.caption("Une ligne = un organe (1 fruit, 1 feuille, 1 graine). Fruit_ID / Seed_ID / Leaf_ID : codes de votre protocole. Mesurer ≥ 10 organes par arbre.")
+            old = q(f"SELECT id, {', '.join(tx + nums)} FROM {t} WHERE arbre_id=? ORDER BY id DESC", (aid,))
+            if not old.empty:
+                st.markdown("**Lignes enregistrées : modifiez une cellule, ou supprimez une ligne (sélection puis touche Suppr), puis appliquez.**")
+                v = st.session_state.get("ver", 0)
+                new = st.data_editor(old, num_rows="dynamic", disabled=["id"], column_config=cfg, key=f"edit_{t}_{aid}_{v}", width="stretch", hide_index=True)
+                n_del = len(set(old.id) - set(new.id.dropna().astype(int)))
+                ok = st.checkbox(f"Je confirme la suppression de {n_del} ligne(s)", key=f"cf_{t}_{aid}_{v}") if n_del else True
+                if st.button("✅ Appliquer les modifications", key=f"ap_{t}", disabled=not ok):
+                    appliquer_edition(t, aid, old, new, tx, nums)
+                    st.session_state["ver"] = v + 1; st.rerun()
+                with st.expander("Indices calculés (lecture seule)"):
+                    st.dataframe(add_indices(t, q(f"SELECT * FROM {t} WHERE arbre_id=?", (aid,))).round(2), width="stretch", hide_index=True)
 
 def page_photo():
     st.header("📷 Photo-mesure calibrée par pièce")
@@ -344,8 +393,36 @@ def page_analyses():
         st.plotly_chart(fig, width="stretch")
         st.caption("Distance euclidienne sur variables centrées-réduites (Ward par défaut de Plotly = complete linkage).")
 
+def fiche():
+    """Fiche au format du protocole : (fruits + graines) une ligne par fruit ; feuilles à part."""
+    a = q("""SELECT id arbre_id, code, id_echantillon, population, date_collecte, collecteur, zone_agroecologique, site, wilaya, latitude,
+             longitude, altitude_m, statut, sexe, etat_sanitaire FROM arbres""")
+    a.columns = ["arbre_id", "Tree_ID", "ID", "Population", "Date", "Collecteur", "Agroecological-zone", "Site", "Wilaya", "Latitude",
+                 "Longitude", "Altitude_m", "Statut", "Sexe_observe", "Etat_sanitaire"]
+    mode = lambda x: x.dropna().mode().iloc[0] if x.dropna().size else None
+    f = load("gousses")[["arbre_id", "fruit_id", "fruit_maturite", "longueur_mm", "largeur_mm", "epaisseur_mm", "poids_g", "nb_graines",
+                         "poids_graines_g", "poids_pulpe_g", "rendement_graines_pct"]]
+    f.columns = ["arbre_id", "Fruit_ID", "Fruit_maturite", "Fruit_longueur_mm", "Fruit_largeur_mm", "Fruit_epaisseur_mm", "Fruit_poids_frais_g",
+                 "Fruit_nb_graines", "Fruit_poids_graines_g", "Fruit_poids_pulpe_g", "Fruit_rendement_graines_%"]
+    sd = load("graines").dropna(subset=["fruit_id"])
+    if len(sd):
+        g = sd.groupby("fruit_id").agg(Seed_IDs_10_graines=("seed_id", lambda x: ";".join(x.dropna().astype(str)[:10])), Seed_longueur=("longueur_mm", "mean"),
+              Seed_largeur=("largeur_mm", "mean"), Seed_epaisseur=("epaisseur_mm", "mean"), Seed_couleur=("couleur", mode),
+              Seed_forme=("forme", mode), Seed_durete=("durete", mode)).reset_index().rename(columns={"fruit_id": "Fruit_ID"})
+        f = f.merge(g, on="Fruit_ID", how="left")
+    fr = a.merge(f, on="arbre_id").drop(columns="arbre_id")
+    lf = load("feuilles")[["arbre_id", "leaf_id", "long_foliole_mm", "larg_foliole_mm", "surface_foliole_cm2"]]
+    lf["surface_foliole_cm2"] *= 100
+    lf.columns = ["arbre_id", "Leaf_ID", "Leaf_longueur_mm", "Leaf_largeur_mm", "Leaf_surface_mm2"]
+    return fr, a[["arbre_id", "Tree_ID"]].merge(lf, on="arbre_id").drop(columns="arbre_id")
+
+
 def page_donnees():
     st.header("💾 Import / Export CSV")
+    fr, lf = fiche()
+    c = st.columns(2)
+    c[0].download_button("⬇️ Fiche protocole : arbres + fruits + graines", fr.to_csv(index=False).encode(), "fiche_fruits_graines.csv", "text/csv")
+    c[1].download_button("⬇️ Fiche protocole : feuilles", lf.to_csv(index=False).encode(), "fiche_feuilles.csv", "text/csv")
     t = st.selectbox("Table", ["arbres", *TRAITS])
     d = q(f"SELECT * FROM {t}")
     st.download_button("⬇️ Exporter", d.to_csv(index=False).encode(), f"{t}.csv", "text/csv")
@@ -463,12 +540,18 @@ def segment_leaflets(data, coin_mm, hmin, hmax, smin, vmin, min_mm2, split):
     if s < 1:
         img = cv2.resize(img, None, fx=s, fy=s)
     g = cv2.medianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 5)
-    c = cv2.HoughCircles(g, cv2.HOUGH_GRADIENT, 1.2, 100, param1=100, param2=25,
+    hsvm = cv2.inRange(cv2.cvtColor(img, cv2.COLOR_BGR2HSV), (hmin, smin, vmin), (hmax, 255, 255))
+    c = cv2.HoughCircles(g, cv2.HOUGH_GRADIENT, 1.2, 40, param1=100, param2=25,
                          minRadius=15, maxRadius=int(min(img.shape[:2]) / 4))
-    if c is None:
+    best = None
+    for cx, cy, cr in (c[0][:12] if c is not None else []):  # la pièce n'est pas verte : on écarte les cercles couvrant des feuilles
+        disc = np.zeros(g.shape, np.uint8); cv2.circle(disc, (int(cx), int(cy)), int(cr), 255, -1)
+        if (hsvm[disc > 0] > 0).mean() < 0.1:
+            best = (cx, cy, cr); break
+    if best is None:
         return [], cv2.cvtColor(img, cv2.COLOR_BGR2RGB), "Pièce étalon non détectée."
-    x, y, r = c[0][0]; pxmm = 2 * r / coin_mm
-    m = cv2.inRange(cv2.cvtColor(img, cv2.COLOR_BGR2HSV), (hmin, smin, vmin), (hmax, 255, 255))
+    x, y, r = best; pxmm = 2 * r / coin_mm
+    m = hsvm.copy()
     cv2.circle(m, (int(x), int(y)), int(r * 1.2), 0, -1)
     k5 = np.ones((5, 5), np.uint8)
     m = cv2.morphologyEx(cv2.morphologyEx(m, cv2.MORPH_OPEN, k5), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
@@ -540,6 +623,16 @@ def calibrate(img, mode, coin_mm):
     return img, 2 * r / coin_mm, f"Pièce détectée : {2 * r / coin_mm:.2f} px/mm (pas de correction de perspective ni de couleur)", (x, y, r)
 
 
+def couleur_nom(L, a, b):
+    """Classe de couleur indicative (seuils de L* à calibrer sur votre matériel)."""
+    n = "noir" if L < 22 else "brun foncé" if L < 32 else "brun moyen" if L < 42 else "brun clair"
+    return n + (" rougeâtre" if n != "noir" and np.degrees(np.arctan2(b, a)) % 360 < 35 else "")
+
+def forme_graine(L, W, circ):
+    r = L / W
+    return "sphérique" if r < 1.15 else "ovale" if r < 1.4 else "elliptique" if r < 1.8 else "allongée"
+
+
 def analyse(img, px, wb, min_mm2, coin=None):
     """Mesures (L, l, longueur curviligne, aire, solidité) + couleur CIELAB (blanc du papier = référence)."""
     g = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (5, 5), 0)
@@ -564,6 +657,7 @@ def analyse(img, px, wb, min_mm2, coin=None):
         l, a, b = lab[mk > 0].mean(0)
         objs.append(dict(L=L, W=W, Lcurv=max(cv2.arcLength(k, True) / px / 2 - W, L), aire_mm2=area,
                          solidite=area / (cv2.contourArea(cv2.convexHull(k)) / px ** 2),
+                         circ=4 * math.pi * cv2.contourArea(k) / cv2.arcLength(k, True) ** 2,
                          L_star=l * 100 / 255, a_star=a - 128, b_star=b - 128, k=k))
     out = img.copy()
     for i, o in enumerate(objs, 1):
@@ -757,7 +851,7 @@ def build_pages(h):
                 st.caption("Solidité basse (< 0,85) = objet probablement fusionné ou mal segmenté : vérifier visuellement.")
                 if aid and st.button("💾 Enregistrer dans « feuilles »"):
                     for x in objs:
-                        h.ins("feuilles", aid, dict(long_foliole_mm=x["L"], larg_foliole_mm=x["W"]), "segmentation")
+                        h.ins("feuilles", aid, dict(long_foliole_mm=x["L"], larg_foliole_mm=x["W"], surface_mm2=x["aire_mm2"]), "segmentation")
                     st.success("Enregistré.")
 
     def p_photo2():
@@ -771,6 +865,7 @@ def build_pages(h):
         coin = c[2].number_input("Diamètre pièce (mm)", 10.0, 40.0, 25.0, .1, key="p2c")
         mn = c[3].number_input("Aire min. (mm²)", 1.0, 5000.0, {"gousses": 200.0, "graines": 8.0, "feuilles": 50.0}[org])
         o, aid = pick()
+        fid = st.text_input("Fruit_ID d'origine des graines (optionnel, relie les 10 graines à leur fruit)") if org == "graines" else ""
         f = st.file_uploader("Photo", type=["jpg", "jpeg", "png"], key="p2f")
         if f and st.button("📐 Mesurer", type="primary"):
             img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), 1)
@@ -788,12 +883,19 @@ def build_pages(h):
                 df["teinte_h"] = (np.degrees(np.arctan2(df.b_star, df.a_star)) % 360).round(0)
                 st.dataframe(df, width="stretch")
                 if aid and st.button("💾 Enregistrer", key="p2s"):
-                    for x in objs:
-                        v = dict(gousses=dict(longueur_mm=x["Lcurv"], largeur_mm=x["W"]), graines=dict(longueur_mm=x["L"], largeur_mm=x["W"]),
-                                 feuilles=dict(long_foliole_mm=x["L"], larg_foliole_mm=x["W"]))[org]
+                    code = h.q("SELECT code FROM arbres WHERE id=?", (aid,)).code[0]
+                    n0 = int(h.q(f"SELECT COUNT(*) n FROM {org} WHERE arbre_id=?", (aid,)).n[0])
+                    for i, x in enumerate(objs, n0 + 1):
+                        if org == "gousses":
+                            v = dict(fruit_id=f"{code}-F{i}", longueur_mm=x["Lcurv"], largeur_mm=x["W"])
+                        elif org == "graines":
+                            v = dict(seed_id=f"{fid or code}-G{i}", fruit_id=fid, longueur_mm=x["L"], largeur_mm=x["W"],
+                                     couleur=couleur_nom(x["L_star"], x["a_star"], x["b_star"]), forme=forme_graine(x["L"], x["W"], x["circ"]))
+                        else:
+                            v = dict(leaf_id=f"{code}-L{i}", long_foliole_mm=x["L"], larg_foliole_mm=x["W"], surface_mm2=x["aire_mm2"])
                         v.update(L_star=x["L_star"], a_star=x["a_star"], b_star=x["b_star"])
                         h.ins(org, aid, v, "photo " + ("A4" if mode == "A4" else "pièce"))
-                    st.success("Enregistré (épaisseur, poids : à saisir dans « Saisie »).")
+                    st.success("Enregistré avec identifiants. Reste à saisir (Saisie) : épaisseur, poids, nb graines, dureté, maturité.")
 
     def p_arch():
         try:
